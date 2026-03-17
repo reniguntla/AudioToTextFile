@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from threading import Thread
 from typing import Generator
 
@@ -19,13 +20,14 @@ MAX_NEW_TOKENS = 256
 
 
 @st.cache_resource(show_spinner=False)
-def load_model_and_tokenizer(model_id: str):
-    tokenizer = AutoTokenizer.from_pretrained(model_id)
+def load_model_and_tokenizer(model_id: str, hf_token: str | None):
+    tokenizer = AutoTokenizer.from_pretrained(model_id, token=hf_token)
     dtype = torch.float16 if torch.cuda.is_available() else torch.float32
     model = AutoModelForCausalLM.from_pretrained(
         model_id,
         torch_dtype=dtype,
         device_map="auto",
+        token=hf_token,
     )
     return tokenizer, model
 
@@ -34,6 +36,14 @@ def init_state() -> None:
     if "chat_history" not in st.session_state:
         st.session_state.chat_history: list[dict[str, str]] = []
 
+
+
+
+def get_hf_token() -> str | None:
+    secrets_token = st.secrets.get("HF_KEY") if hasattr(st, "secrets") else None
+    env_token = os.getenv("HF_KEY")
+    token = secrets_token or env_token
+    return token.strip() if isinstance(token, str) and token.strip() else None
 
 def build_messages(history: list[dict[str, str]], user_input: str) -> list[dict[str, str]]:
     messages = [
@@ -84,9 +94,10 @@ def stream_model_response(
     model_name: str,
     history: list[dict[str, str]],
     user_input: str,
+    hf_token: str | None,
 ) -> Generator[str, None, None]:
     model_id = MODEL_OPTIONS[model_name]
-    tokenizer, model = load_model_and_tokenizer(model_id)
+    tokenizer, model = load_model_and_tokenizer(model_id, hf_token)
     input_ids = enforce_context_limit(tokenizer, history, user_input).to(model.device)
 
     streamer = TextIteratorStreamer(
@@ -125,6 +136,7 @@ def main() -> None:
     st.caption("Chat with small language models using short-term conversation memory.")
 
     init_state()
+    hf_token = get_hf_token()
 
     selected_model = st.selectbox(
         "SLM Selection",
@@ -132,6 +144,10 @@ def main() -> None:
         index=list(MODEL_OPTIONS.keys()).index(DEFAULT_MODEL),
     )
     st.info(f"Currently Using Model: {selected_model}")
+    if hf_token:
+        st.caption("Hugging Face access token detected via HF_KEY.")
+    else:
+        st.warning("HF_KEY is not configured. Private or gated Hugging Face models may fail to load.")
 
     clear_clicked = st.button("Clear Conversation")
     if clear_clicked:
@@ -158,6 +174,7 @@ def main() -> None:
                     selected_model,
                     st.session_state.chat_history,
                     question,
+                    hf_token,
                 ):
                     full_response += piece
                     response_placeholder.markdown(full_response + "▌")

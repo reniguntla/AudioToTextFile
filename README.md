@@ -32,3 +32,20 @@ streamlit run app.py
 ```
 
 Then open the Streamlit URL shown in your terminal (typically `http://localhost:8501`).
+
+
+## Hugging Face Token (`HF_KEY`)
+
+Set a Hugging Face access token to download gated/private models:
+
+```bash
+export HF_KEY=your_huggingface_token
+```
+
+You can also set `HF_KEY` in Streamlit secrets (`.streamlit/secrets.toml`):
+
+```toml
+HF_KEY = "your_huggingface_token"
+```
+
+The app reads `HF_KEY` from Streamlit secrets first, then environment variables.
