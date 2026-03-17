@@ -19,16 +19,34 @@ MAX_CONTEXT_TOKENS = 3500
 MAX_NEW_TOKENS = 256
 
 
+def _hf_auth_kwargs(hf_token: str | None) -> dict[str, str | bool]:
+    """Return kwargs compatible with multiple transformers versions."""
+    if not hf_token:
+        return {"trust_remote_code": True}
+
+    # Newer versions use `token`; older versions may still expect `use_auth_token`.
+    return {
+        "token": hf_token,
+        "use_auth_token": hf_token,
+        "trust_remote_code": True,
+    }
+
+
 @st.cache_resource(show_spinner=False)
 def load_model_and_tokenizer(model_id: str, hf_token: str | None):
-    tokenizer = AutoTokenizer.from_pretrained(model_id, token=hf_token)
+    auth_kwargs = _hf_auth_kwargs(hf_token)
+
+    tokenizer = AutoTokenizer.from_pretrained(model_id, **auth_kwargs)
     dtype = torch.float16 if torch.cuda.is_available() else torch.float32
     model = AutoModelForCausalLM.from_pretrained(
         model_id,
         torch_dtype=dtype,
         device_map="auto",
-        token=hf_token,
+        **auth_kwargs,
     )
+
+    if tokenizer.pad_token is None and tokenizer.eos_token is not None:
+        tokenizer.pad_token = tokenizer.eos_token
     return tokenizer, model
 
 
@@ -37,13 +55,30 @@ def init_state() -> None:
         st.session_state.chat_history: list[dict[str, str]] = []
 
 
-
-
 def get_hf_token() -> str | None:
-    secrets_token = st.secrets.get("HF_KEY") if hasattr(st, "secrets") else None
-    env_token = os.getenv("HF_KEY")
-    token = secrets_token or env_token
-    return token.strip() if isinstance(token, str) and token.strip() else None
+    token_candidates = []
+
+    if hasattr(st, "secrets"):
+        token_candidates.extend(
+            [
+                st.secrets.get("HF_KEY"),
+                st.secrets.get("HF_TOKEN"),
+            ]
+        )
+
+    token_candidates.extend(
+        [
+            os.getenv("HF_KEY"),
+            os.getenv("HF_TOKEN"),
+            os.getenv("HUGGINGFACEHUB_API_TOKEN"),
+        ]
+    )
+
+    for token in token_candidates:
+        if isinstance(token, str) and token.strip():
+            return token.strip()
+    return None
+
 
 def build_messages(history: list[dict[str, str]], user_input: str) -> list[dict[str, str]]:
     messages = [
@@ -99,6 +134,7 @@ def stream_model_response(
     model_id = MODEL_OPTIONS[model_name]
     tokenizer, model = load_model_and_tokenizer(model_id, hf_token)
     input_ids = enforce_context_limit(tokenizer, history, user_input).to(model.device)
+    attention_mask = torch.ones_like(input_ids)
 
     streamer = TextIteratorStreamer(
         tokenizer,
@@ -108,6 +144,8 @@ def stream_model_response(
 
     generation_kwargs = {
         "input_ids": input_ids,
+        "attention_mask": attention_mask,
+        "pad_token_id": tokenizer.pad_token_id,
         "max_new_tokens": MAX_NEW_TOKENS,
         "do_sample": True,
         "temperature": 0.7,
@@ -145,9 +183,11 @@ def main() -> None:
     )
     st.info(f"Currently Using Model: {selected_model}")
     if hf_token:
-        st.caption("Hugging Face access token detected via HF_KEY.")
+        st.caption("Hugging Face token detected (HF_KEY / HF_TOKEN).")
     else:
-        st.warning("HF_KEY is not configured. Private or gated Hugging Face models may fail to load.")
+        st.warning(
+            "No Hugging Face token found. Set HF_KEY or HF_TOKEN for gated/private models and better Hub rate limits."
+        )
 
     clear_clicked = st.button("Clear Conversation")
     if clear_clicked:
