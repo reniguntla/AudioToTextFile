@@ -1,96 +1,235 @@
 from __future__ import annotations
 
-import io
-import tempfile
-from pathlib import Path
+import os
+from threading import Thread
+from typing import Generator
 
 import streamlit as st
-import whisper
-from pydub import AudioSegment
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer, TextIteratorStreamer
 
-SUPPORTED_TYPES = ["wav", "aiff", "pcm", "mp3", "aac"]
-PCM_SAMPLE_RATES = [8000, 16000, 22050, 32000, 44100, 48000]
+MODEL_OPTIONS = {
+    "Phi-3": "microsoft/Phi-3-mini-4k-instruct",
+    "Gemma": "google/gemma-2-2b-it",
+    "Mistral": "mistralai/Mistral-7B-Instruct-v0.3",
+}
+DEFAULT_MODEL = "Phi-3"
+MAX_HISTORY_PAIRS = 10
+MAX_CONTEXT_TOKENS = 3500
+MAX_NEW_TOKENS = 256
+
+
+def _hf_auth_kwargs(hf_token: str | None) -> dict[str, str | bool]:
+    """Return kwargs compatible with multiple transformers versions."""
+    if not hf_token:
+        return {"trust_remote_code": True}
+
+    # Newer versions use `token`; older versions may still expect `use_auth_token`.
+    return {
+        "token": hf_token,
+        "use_auth_token": hf_token,
+        "trust_remote_code": True,
+    }
 
 
 @st.cache_resource(show_spinner=False)
-def load_model() -> whisper.Whisper:
-    return whisper.load_model("base")
+def load_model_and_tokenizer(model_id: str, hf_token: str | None):
+    auth_kwargs = _hf_auth_kwargs(hf_token)
+
+    tokenizer = AutoTokenizer.from_pretrained(model_id, **auth_kwargs)
+    dtype = torch.float16 if torch.cuda.is_available() else torch.float32
+    model = AutoModelForCausalLM.from_pretrained(
+        model_id,
+        torch_dtype=dtype,
+        device_map="auto",
+        **auth_kwargs,
+    )
+
+    if tokenizer.pad_token is None and tokenizer.eos_token is not None:
+        tokenizer.pad_token = tokenizer.eos_token
+    return tokenizer, model
 
 
-def to_wav_bytes(uploaded_file, suffix: str, pcm_sample_rate: int) -> bytes:
-    if suffix == "pcm":
-        raw_data = uploaded_file.read()
-        audio = AudioSegment(
-            data=raw_data,
-            sample_width=2,
-            frame_rate=pcm_sample_rate,
-            channels=1,
+def init_state() -> None:
+    if "chat_history" not in st.session_state:
+        st.session_state.chat_history: list[dict[str, str]] = []
+
+
+def get_hf_token() -> str | None:
+    token_candidates = []
+
+    if hasattr(st, "secrets"):
+        token_candidates.extend(
+            [
+                st.secrets.get("HF_KEY"),
+                st.secrets.get("HF_TOKEN"),
+            ]
         )
-    else:
-        audio = AudioSegment.from_file(io.BytesIO(uploaded_file.read()), format=suffix)
-    return audio.set_channels(1).set_frame_rate(16000).export(format="wav").read()
+
+    token_candidates.extend(
+        [
+            os.getenv("HF_KEY"),
+            os.getenv("HF_TOKEN"),
+            os.getenv("HUGGINGFACEHUB_API_TOKEN"),
+        ]
+    )
+
+    for token in token_candidates:
+        if isinstance(token, str) and token.strip():
+            return token.strip()
+    return None
 
 
-def transcribe_audio(wav_bytes: bytes) -> str:
-    model = load_model()
-    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_wav:
-        temp_wav.write(wav_bytes)
-        temp_path = temp_wav.name
+def build_messages(history: list[dict[str, str]], user_input: str) -> list[dict[str, str]]:
+    messages = [
+        {
+            "role": "system",
+            "content": "You are a helpful and concise assistant.",
+        }
+    ]
+    for turn in history:
+        messages.append({"role": "user", "content": turn["question"]})
+        messages.append({"role": "assistant", "content": turn["answer"]})
+    messages.append({"role": "user", "content": user_input})
+    return messages
 
-    try:
-        result = model.transcribe(temp_path)
-        return result.get("text", "").strip()
-    finally:
-        Path(temp_path).unlink(missing_ok=True)
+
+def enforce_context_limit(
+    tokenizer,
+    history: list[dict[str, str]],
+    user_input: str,
+) -> torch.Tensor:
+    working_history = history.copy()
+
+    while working_history:
+        messages = build_messages(working_history, user_input)
+        tokenized = tokenizer.apply_chat_template(
+            messages,
+            tokenize=True,
+            add_generation_prompt=True,
+            return_tensors="pt",
+        )
+        if tokenized.shape[-1] <= MAX_CONTEXT_TOKENS:
+            return tokenized
+        working_history.pop(0)
+
+    messages = build_messages([], user_input)
+    tokenized = tokenizer.apply_chat_template(
+        messages,
+        tokenize=True,
+        add_generation_prompt=True,
+        return_tensors="pt",
+    )
+    if tokenized.shape[-1] > MAX_CONTEXT_TOKENS:
+        tokenized = tokenized[:, -MAX_CONTEXT_TOKENS:]
+    return tokenized
+
+
+def stream_model_response(
+    model_name: str,
+    history: list[dict[str, str]],
+    user_input: str,
+    hf_token: str | None,
+) -> Generator[str, None, None]:
+    model_id = MODEL_OPTIONS[model_name]
+    tokenizer, model = load_model_and_tokenizer(model_id, hf_token)
+    input_ids = enforce_context_limit(tokenizer, history, user_input).to(model.device)
+    attention_mask = torch.ones_like(input_ids)
+
+    streamer = TextIteratorStreamer(
+        tokenizer,
+        skip_prompt=True,
+        skip_special_tokens=True,
+    )
+
+    generation_kwargs = {
+        "input_ids": input_ids,
+        "attention_mask": attention_mask,
+        "pad_token_id": tokenizer.pad_token_id,
+        "max_new_tokens": MAX_NEW_TOKENS,
+        "do_sample": True,
+        "temperature": 0.7,
+        "top_p": 0.9,
+        "streamer": streamer,
+    }
+
+    thread = Thread(target=model.generate, kwargs=generation_kwargs)
+    thread.start()
+
+    for chunk in streamer:
+        yield chunk
+
+
+def render_history(history: list[dict[str, str]]) -> None:
+    for turn in history:
+        with st.chat_message("user"):
+            st.markdown(turn["question"])
+        with st.chat_message("assistant"):
+            st.markdown(turn["answer"])
 
 
 def main() -> None:
-    st.set_page_config(page_title="Audio Transcript Generator", page_icon="🎙️")
-    st.title("🎙️ Audio Transcript Generator")
-    st.write(
-        "Upload an audio file and generate a transcript. Supported formats: "
-        + ", ".join(SUPPORTED_TYPES)
-        + "."
-    )
+    st.set_page_config(page_title="SLM Chat Interface", page_icon="💬")
+    st.title("💬 Streamlit SLM Chat")
+    st.caption("Chat with small language models using short-term conversation memory.")
 
-    uploaded_file = st.file_uploader(
-        "Choose an audio file",
-        type=SUPPORTED_TYPES,
-        accept_multiple_files=False,
-    )
+    init_state()
+    hf_token = get_hf_token()
 
-    pcm_sample_rate = 16000
-    if uploaded_file and uploaded_file.name.lower().endswith(".pcm"):
-        pcm_sample_rate = st.selectbox(
-            "PCM sample rate",
-            options=PCM_SAMPLE_RATES,
-            index=1,
-            help="Choose the sample rate of the raw PCM input.",
+    selected_model = st.selectbox(
+        "SLM Selection",
+        options=list(MODEL_OPTIONS.keys()),
+        index=list(MODEL_OPTIONS.keys()).index(DEFAULT_MODEL),
+    )
+    st.info(f"Currently Using Model: {selected_model}")
+    if hf_token:
+        st.caption("Hugging Face token detected (HF_KEY / HF_TOKEN).")
+    else:
+        st.warning(
+            "No Hugging Face token found. Set HF_KEY or HF_TOKEN for gated/private models and better Hub rate limits."
         )
 
-    if uploaded_file:
-        suffix = uploaded_file.name.rsplit(".", 1)[-1].lower()
-        st.audio(uploaded_file)
-        if st.button("Generate Transcript", type="primary"):
-            with st.spinner("Transcribing audio..."):
-                try:
-                    wav_bytes = to_wav_bytes(uploaded_file, suffix, pcm_sample_rate)
-                    transcript = transcribe_audio(wav_bytes)
-                except Exception as exc:  # noqa: BLE001
-                    st.error(f"Unable to transcribe this file: {exc}")
-                    return
+    clear_clicked = st.button("Clear Conversation")
+    if clear_clicked:
+        st.session_state.chat_history = []
+        st.success("Conversation cleared.")
 
-            if transcript:
-                st.subheader("Transcript")
-                st.write(transcript)
-                st.download_button(
-                    "Download transcript",
-                    transcript,
-                    file_name="transcript.txt",
-                    mime="text/plain",
-                )
-            else:
-                st.warning("No speech detected in this audio.")
+    st.subheader("Conversation Window")
+    render_history(st.session_state.chat_history)
+
+    with st.form("chat_form", clear_on_submit=True):
+        user_input = st.text_input("Question Input", placeholder="Type your question here")
+        submit = st.form_submit_button("Submit", type="primary")
+
+    if submit and user_input.strip():
+        question = user_input.strip()
+        with st.chat_message("user"):
+            st.markdown(question)
+
+        with st.chat_message("assistant"):
+            response_placeholder = st.empty()
+            full_response = ""
+            try:
+                for piece in stream_model_response(
+                    selected_model,
+                    st.session_state.chat_history,
+                    question,
+                    hf_token,
+                ):
+                    full_response += piece
+                    response_placeholder.markdown(full_response + "▌")
+            except Exception as exc:  # noqa: BLE001
+                st.error(f"Generation failed for {selected_model}: {exc}")
+                return
+
+            response_placeholder.markdown(full_response)
+
+        st.session_state.chat_history.append(
+            {"question": question, "answer": full_response.strip()}
+        )
+        st.session_state.chat_history = st.session_state.chat_history[-MAX_HISTORY_PAIRS:]
+    elif submit:
+        st.warning("Please enter a question before submitting.")
 
 
 if __name__ == "__main__":
